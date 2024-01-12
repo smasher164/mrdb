@@ -18,7 +18,8 @@
         devShell = pkgs.mkShell {
           buildInputs = with pkgs;
             [
-              (rust-bin.selectLatestNightlyWith (toolchain: toolchain.default))
+              rust-bin.stable.latest.default
+              # (rust-bin.selectLatestNightlyWith (toolchain: toolchain.default))
             ];
         };
       });
