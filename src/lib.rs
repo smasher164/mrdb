@@ -36,9 +36,7 @@ const PID_MASK: u64 = !PAGE_COUNT_MASK;
 const OFFSET_MASK: u64 = PID_MASK;
 const MAX_PAGES: u64 = 1 << 52;
 const MAX_PAGES_LARGE: u64 = 1 << 40;
-const A : u64 = (1<<56)-1;
-const B : u64 = 0x0080000000000000;
-const C : u64 = 8<<52;
+const DIRTY_BIT_MASK: u64 = 1 << (57 - 1);
 // TODO: disable huge pages (MADV_NOHUGEPAGE)
 // TODO: set random reads likely
 // TODO: use async i/o for disk reads and writes instead of pread/pwrite.
@@ -253,21 +251,27 @@ fn advise_random_read(f: &File) -> Result<()> {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PageState(u64);
 
+// TODO: Change top 7 bits of PageState to hold these tags. to be 7 bits
+// Reserve one bit for dirty bit.
+// Use rest of 56 bits for ABA counter.
 impl PageState {
     const UNLOCKED: PageState = PageState(0);
-    const LOCKED_SHARED: PageState = PageState(252);
-    const LOCKED: PageState = PageState(253);
-    const MARKED: PageState = PageState(254);
-    const EVICTED: PageState = PageState(255);
+    const LOCKED_SHARED: PageState = PageState(124);
+    const LOCKED: PageState = PageState(125);
+    const MARKED: PageState = PageState(126);
+    const EVICTED: PageState = PageState(127);
 
     fn get(x: u64) -> PageState {
-        PageState(x >> 56)
+        PageState(x >> 57)
     }
     fn set(x: u64, st: PageState) -> u64 {
-        ((x << 8) >> 8) | st.0 << 56
+        ((x << 7) >> 7) | st.0 << 57
     }
     fn inc(x: u64, st: PageState) -> u64 {
-        (((x << 8) >> 8) + 1) | st.0 << 56
+        (((x << 8) >> 8) + 1) | (x & DIRTY_BIT_MASK) | st.0 << 57
+    }
+    fn is_dirty(x: u64) -> bool {
+        (x & DIRTY_BIT_MASK) != 0
     }
 }
 
@@ -296,11 +300,6 @@ impl Default for PageEntry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[repr(align(4096))]
-struct PageHeader {
-    is_dirty: bool
 }
 
 struct PageCache {
@@ -341,7 +340,12 @@ impl PageCache {
         //     init_boxed_slice(cache_elems as usize, |_| PageEntry::new());
 
         // TODO: maybe we'll need counts
-        Ok(PageCache { mem, page_state, f, cache_elems })
+        Ok(PageCache {
+            mem,
+            page_state,
+            f,
+            cache_elems,
+        })
     }
     // fn to_ptr
     // should this be owned? or a reference? C++ does refs, but they're mutable.
@@ -434,53 +438,58 @@ impl PageCache {
             }
         }
     }
-    fn is_dirty(&self, page_id: PageId) -> bool {
-        0 != unsafe { self.mem.to_slice(page_id)[0] }
-        // stores dirty/non-dirty in page itself.
-    }
+    // fn is_dirty(&self, page_id: PageId) -> bool {
+    //     0 != unsafe { self.mem.to_slice(page_id)[0] }
+    //     // stores dirty/non-dirty in page itself.
+    // }
     // eviction based on CLOCK, but consider trying SIEVE
     // https://cachemon.github.io/SIEVE-website/blog/2023/12/17/sieve-is-simpler-than-lru/
     fn evict(&self) {
         const BATCH_SIZE: usize = 64;
-        let candidates : Vec<PageId> = self.page_state.iter().filter_map(|pg| {
-            let old = pg.value().0.load(Ordering::SeqCst);
-            match PageState::get(old) {
-            PageState::MARKED => {
-                // Obtain exclusive lock to page if it was locked for eviction.
-                let new = PageState::set(old, PageState::LOCKED);
-                if pg.value().cas(old, new) {
-                    return Some(*pg.key());
+        let candidates: Vec<PageId> = self
+            .page_state
+            .iter()
+            .filter_map(|pg| {
+                let old = pg.value().0.load(Ordering::SeqCst);
+                match PageState::get(old) {
+                    PageState::MARKED => {
+                        // Obtain exclusive lock to page if it was locked for eviction.
+                        let new = PageState::set(old, PageState::LOCKED);
+                        if pg.value().cas(old, new) {
+                            return Some(*pg.key());
+                        }
+                    }
+                    // PageState::UNLOCKED => todo!(),
                 }
-            },
-            // PageState::UNLOCKED => todo!(),
-            }
-            None
-            // pg.key()
-            // pg.value()
-            // we need to store clock pos
-            // pg.0.l
-            // let old = entry.0.load(Ordering::SeqCst);
-        }).take(64).collect();
+                None
+                // pg.key()
+                // pg.value()
+                // we need to store clock pos
+                // pg.0.l
+                // let old = entry.0.load(Ordering::SeqCst);
+            })
+            .take(64)
+            .collect();
         // Check if page is dirty. If so, write it.
         candidates.iter().for_each(|page_id| {
-            if self.is_dirty(*page_id) {
+            let st = self.get_page_entry(*page_id);
+            let old = st.0.load(Ordering::SeqCst);
+            if PageState::is_dirty(old) {
                 unsafe { self.write_page(*page_id) };
             }
         });
-        candidates.iter().for_each(|page_id| {
-            unsafe {
+        candidates.iter().for_each(|page_id| unsafe {
             let m = self.mem.to_ptr(*page_id);
             release(m, page_id.size());
-            }
         });
         candidates.iter().for_each(|page_id| {
             let entry = self.get_page_entry(*page_id);
             let old = entry.0.load(Ordering::SeqCst);
             match PageState::get(old) {
-            PageState::LOCKED => {
-                let new = PageState::inc(old, PageState::UNLOCKED);
-                entry.0.store(new, Ordering::Release);
-            }
+                PageState::LOCKED => {
+                    let new = PageState::inc(old, PageState::UNLOCKED);
+                    entry.0.store(new, Ordering::Release);
+                }
             }
         });
     }
