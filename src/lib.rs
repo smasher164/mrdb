@@ -199,10 +199,11 @@ struct PageId(u64);
 impl PageId {
     // should this return a u16?
     fn page_count(self) -> u64 {
-        (self.0 & PAGE_COUNT_MASK) + 1
+        let n = (self.0 & PAGE_COUNT_MASK) + 1;
+        n*n*n // 1, 8, 27, ...
     }
     fn size(self) -> u64 {
-        self.page_count() * PAGE_SIZE
+        self.page_count() * PAGE_SIZE // 4K,32K,81K,256K,500K,864K,1372K,..256TB
     }
     fn pid(self) -> u64 {
         (self.0 & PID_MASK) >> 12
