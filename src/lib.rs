@@ -434,39 +434,18 @@ impl PageCache {
         let ahasher = ahash::RandomState::new();
         let page_state = DashMap::with_hasher(ahasher);
         let residents = ResidentSet::new(cache_elems);
-        // let cache = Cache::builder()
-        //     .max_capacity(cache_elems)
-        //     // .support_invalidation_closures()
-        //     .eviction_listener(|a, _, _| {
-
-        //     })
-        //     .build_with_hasher(ahasher);
-        // let residents = IndexSet::with_capacity_and_hasher(cache_elems as usize, ahasher);
-        // let hand = AtomicU64::new(0);
-
-        // let page_state: Box<[PageEntry]> =
-        //     init_boxed_slice(cache_elems as usize, |_| PageEntry::new());
-
-        // TODO: maybe we'll need counts
         Ok(PageCache {
             mem,
             page_state,
             f,
             residents,
-            // cache,
-            // hand,
-            // residents,
         })
     }
-    // fn to_ptr
-    // should this be owned? or a reference? C++ does refs, but they're mutable.
-    // maybe mut ref?
     fn get_page_entry(&self, page_id: PageId) -> RefMut<'_, PageId, PageEntry, ahash::RandomState> {
         // &self.page_state[page_id.pid() as usize]
         let entry = self.page_state.entry(page_id);
         let or_def = entry.or_default();
         or_def
-        // or_def.value()
     }
     unsafe fn read_page(&self, page_id: PageId) -> Result<u64> {
         let buf = self.mem.to_ptr(page_id);
@@ -617,3 +596,6 @@ impl PageCache {
         }
     }
 }
+
+fn get_disk_size() -> u64 { todo!() }
+fn get_max_file_size() -> u64 { todo!() }
