@@ -1,6 +1,6 @@
 use mrdb;
 
 fn main() {
-    mrdb::foo();
+    // mrdb::foo();
     println!("Hello, world!");
 }
