@@ -32,6 +32,7 @@ type Result<T> = core::result::Result<T, Error>;
 const KB: u64 = 1024;
 const MB: u64 = 1024 * KB;
 const GB: u64 = 1024 * MB;
+const TB: u64 = 1024 * GB;
 const PAGE_SIZE: u64 = 4 * KB;
 const PAGE_COUNT_MASK: u64 = PAGE_SIZE - 1;
 const PID_MASK: u64 = !PAGE_COUNT_MASK;
@@ -611,6 +612,7 @@ impl PageCache {
     }
 }
 
+#[derive(Debug)]
 pub struct FsInfo {
     disk_size: u64,
     max_file_size: u64,
@@ -619,6 +621,7 @@ pub struct FsInfo {
 fn max_file_size_from_fs_name(fs_name: &str) -> u64 {
     match fs_name {
         "apfs" => u64::MAX, // 16 EIB (technically it's 1+MAX but this really doesn't matter)
+        "ext4" => 16 * TB,
         _ => todo!(),
     }
 }
