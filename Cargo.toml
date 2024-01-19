@@ -27,4 +27,5 @@ moka = { version = "0.12.3", features = ["sync"] }
 libc = "0.2.151"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52.0", features = ["Win32", "Win32_System", "Win32_System_Memory", "Win32_Foundation"] }
+windows-sys = { version = "0.52.0", features = ["Win32", "Win32_System", "Win32_System_Memory", "Win32_Foundation", "Win32_Storage", "Win32_Storage_FileSystem"] }
+widestring = "1.0.2"

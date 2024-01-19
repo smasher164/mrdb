@@ -15,12 +15,21 @@
           overlays = [ (import rust-overlay) ];
         };
       in {
-        devShell = pkgs.mkShell {
-          buildInputs = with pkgs;
-            [
-              rust-bin.stable.latest.default
-              # (rust-bin.selectLatestNightlyWith (toolchain: toolchain.default))
-            ];
-        };
+        devShell = with pkgs;
+          mkShell {
+            nativeBuildInputs = # with pkgs;
+              [
+                #              (rust-bin.stable.latest.default.override {
+                #  targets = [ "x86_64-pc-windows-gnu" "x86_64-unknown-freebsd" ];
+                #})
+                wine64Packages.staging
+                pkg-config
+                (rust-bin.selectLatestNightlyWith (toolchain:
+                  toolchain.default.override {
+                    extensions = [ "rust-src" "miri" ];
+                    targets = [ "x86_64-pc-windows-gnu" "x86_64-unknown-freebsd" ];
+                  }))
+              ];
+          };
       });
 }

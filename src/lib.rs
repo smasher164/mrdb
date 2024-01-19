@@ -1,19 +1,30 @@
+use dashmap::{mapref::one::RefMut, DashMap};
 use init_array::init_boxed_slice;
 use std::{
     fs::File,
     io,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering}, str::Utf8Error,
 };
-use dashmap::{DashMap, mapref::one::RefMut};
 
 use core::ffi::c_void;
 
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-enum Error {
+pub enum Error {
     #[error("{0}")]
     Io(#[from] io::Error),
+
+    #[error("{0}")]
+    Utf8Error(#[from] Utf8Error),
+
+    #[cfg(target_family = "windows")]
+    #[error("{0}")]
+    MissingTerminator(#[from] widestring::error::MissingNulTerminator),
+
+    #[cfg(target_family = "windows")]
+    #[error("{0}")]
+    Utf16Error(#[from] widestring::error::Utf16Error),
 }
 
 type Result<T> = core::result::Result<T, Error>;
@@ -60,6 +71,7 @@ impl Mmap {
 #[cfg(target_family = "windows")]
 impl Mmap {
     fn create_virt_mem(vm_size: u64) -> Result<Mmap> {
+        use std::ptr::null;
         unsafe {
             use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
             let p = VirtualAlloc(null(), vm_size as usize, MEM_RESERVE, PAGE_READWRITE);
@@ -88,11 +100,10 @@ impl Mmap {
     }
     // not sure when this is needed. do we really want the pointer to be tagged?
     unsafe fn to_page_id(&self, ptr: *mut u8) -> PageId {
-        // ptr should be tagged with the (page_count-1)
+        // ptr should be tagged with the page_count.
         // Since we're 4K aligned, we have 12 bits free in the LSB.
         // requires masking before use.
-        let u_ptr = ptr as u64;
-        let page_count = (u_ptr & PAGE_COUNT_MASK) + 1;
+        let page_count = (ptr as u64) & PAGE_COUNT_MASK;
         // determine offset into vm
         let offset = ptr.offset_from(self.0) as u64;
         PageId::new_offset(page_count, offset & OFFSET_MASK)
@@ -153,6 +164,7 @@ impl Pread for File {
 impl Pwrite for File {
     fn pwrite(&self, buf: *const u8, offset: u64, size: u64) -> Result<u64> {
         use std::os::windows::fs::FileExt;
+        use std::slice::from_raw_parts;
         let slice = unsafe { from_raw_parts(buf, size as usize) };
         self.seek_write(slice, offset)
             .map(|us| us as u64)
@@ -228,6 +240,7 @@ impl PageId {
     }
 }
 
+#[cfg(target_family = "unix")]
 fn advise_random_read(f: &File) -> Result<()> {
     unsafe {
         use libc::{posix_fadvise, POSIX_FADV_RANDOM};
@@ -305,7 +318,7 @@ impl PageEntry {
         loop {
             let old = self.0.load(Ordering::SeqCst);
             let st = PageState::get(old);
-            if self.cas_weak(old, PageState::set(old, PageState(st.0-1))) {
+            if self.cas_weak(old, PageState::set(old, PageState(st.0 - 1))) {
                 return;
             }
         }
@@ -418,9 +431,8 @@ impl ResidentSet {
 impl PageCache {
     fn new(f: File, vm_size_bytes: u64, cache_elems: u64) -> Result<PageCache> {
         // hint that we're going to be doing random reads
-        if cfg!(target_family = "unix") {
-            advise_random_read(&f)?;
-        }
+        #[cfg(target_family = "unix")]
+        advise_random_read(&f)?;
         /*
         vmSize = min(
             MAX_PAGES * PAGE_SIZE,
@@ -462,7 +474,9 @@ impl PageCache {
         self.f.pwrite(buf, offset, size)
     }
     fn ensure_free_pages(&self) {
-        if (1 + self.residents.used.load(Ordering::SeqCst)) >= (((self.residents.entries.len() as f64) * 0.95) as u64) {
+        if (1 + self.residents.used.load(Ordering::SeqCst))
+            >= (((self.residents.entries.len() as f64) * 0.95) as u64)
+        {
             self.evict();
         }
     }
@@ -499,7 +513,7 @@ impl PageCache {
                         // return self.mem.to_slice(page_id) // do we want read or write?
                     }
                 }
-                _ => ()
+                _ => (),
             }
         }
     }
@@ -534,7 +548,7 @@ impl PageCache {
                     self.fix(page_id);
                     self.unfix(page_id);
                 }
-                _ => ()
+                _ => (),
             }
         }
     }
@@ -597,5 +611,119 @@ impl PageCache {
     }
 }
 
-fn get_disk_size() -> u64 { todo!() }
-fn get_max_file_size() -> u64 { todo!() }
+pub struct FsInfo {
+    disk_size: u64,
+    max_file_size: u64,
+}
+
+fn max_file_size_from_fs_name(fs_name: &str) -> u64 {
+    match fs_name {
+        "apfs" => u64::MAX, // 16 EIB (technically it's 1+MAX but this really doesn't matter)
+        _ => todo!(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fs_name_from_f_type(f_type: i64) -> &'static str {
+    match f_type {
+        libc::EXT4_SUPER_MAGIC => "ext4",
+        _ => todo!(),
+    }
+}
+
+// Given a file, obtain the
+// - The size of the disk it's contained on.
+// - The maximum size of a file on the file system it's contained on.
+#[cfg(all(target_family = "unix", not(target_os = "linux")))]
+pub fn get_fs_info(file: &File) -> Result<FsInfo> {
+    use libc::{fstatfs, statfs};
+    use std::{ffi::CStr, mem::MaybeUninit, os::fd::AsRawFd};
+    let mut buf: MaybeUninit<statfs> = MaybeUninit::uninit();
+    unsafe {
+        if fstatfs(file.as_raw_fd(), buf.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let st = buf.assume_init();
+        let fs_name = CStr::from_ptr(st.f_fstypename.as_ptr()).to_str()?;
+        let disk_size = st.f_blocks * (st.f_bsize as u64);
+        let max_file_size = max_file_size_from_fs_name(fs_name);
+        Ok(FsInfo {
+            disk_size,
+            max_file_size,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_fs_info(file: &File) -> Result<FsInfo> {
+    use libc::{fstatfs64, statfs64};
+    use std::{mem::MaybeUninit, os::fd::AsRawFd};
+    let mut buf: MaybeUninit<statfs64> = MaybeUninit::uninit();
+    let st = unsafe {
+        if fstatfs64(file.as_raw_fd(), buf.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        buf.assume_init()
+    };
+    let disk_size = st.f_blocks * (st.f_bsize as u64);
+    let fsname = fs_name_from_f_type(st.f_type);
+    let max_file_size = max_file_size_from_fs_name(fsname);
+    Ok(FsInfo {
+        disk_size,
+        max_file_size,
+    })
+}
+
+#[cfg(target_family = "windows")]
+pub fn get_fs_info(file: &File) -> Result<FsInfo> {
+    use std::{
+        mem::MaybeUninit,
+        os::windows::io::AsRawHandle,
+        ptr::null_mut,
+    };
+    use widestring::{U16CStr, U16String};
+    use windows_sys::Win32::{
+        Foundation::MAX_PATH,
+        Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumeInformationByHandleW},
+    };
+    let raw_handle = file.as_raw_handle() as isize;
+    unsafe {
+        let mut vol_name_buf =
+            MaybeUninit::<[MaybeUninit<u16>; MAX_PATH as usize + 1]>::uninit().assume_init();
+        let mut fs_name_buf =
+            MaybeUninit::<[MaybeUninit<u16>; MAX_PATH as usize + 1]>::uninit().assume_init();
+        if GetVolumeInformationByHandleW(
+            raw_handle,
+            vol_name_buf.as_mut_ptr() as *mut u16,
+            vol_name_buf.len() as u32,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            fs_name_buf.as_mut_ptr() as *mut u16,
+            fs_name_buf.len() as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        let vol_name = U16CStr::from_ptr_truncate(vol_name_buf.as_ptr() as *const u16, vol_name_buf.len())?;
+        let dir_name = U16String::from_str(&format!(r#"\\?\Volume{}\"#, vol_name.display()));
+        let mut disk_size = MaybeUninit::<u64>::uninit();
+        if GetDiskFreeSpaceExW(
+            dir_name.as_ptr(),
+            null_mut(),
+            disk_size.as_mut_ptr(),
+            null_mut(),
+        ) == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        let disk_size = disk_size.assume_init();
+        let fs_name =
+            U16CStr::from_ptr_truncate(fs_name_buf.as_ptr() as *const u16, fs_name_buf.len())?.to_string()?;
+        let max_file_size = max_file_size_from_fs_name(&fs_name);
+        Ok(FsInfo {
+            disk_size,
+            max_file_size,
+        })
+    }
+}
