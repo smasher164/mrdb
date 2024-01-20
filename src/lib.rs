@@ -9,9 +9,21 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use core::ffi::c_void;
-
 use thiserror::Error;
+
+#[cfg_attr(target_family = "unix", path = "os_unix.rs")]
+#[cfg_attr(target_family = "windows", path = "os_windows.rs")]
+mod os;
+pub use os::*;
+
+#[cfg_attr(target_os = "linux", path = "fsinfo_linux.rs")]
+#[cfg_attr(
+    all(target_family = "unix", not(target_os = "linux")),
+    path = "fsinfo_unix.rs"
+)]
+#[cfg_attr(target_family = "windows", path = "fsinfo_windows.rs")]
+mod fsinfo;
+pub use fsinfo::*;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -49,45 +61,6 @@ const BATCH_SIZE: u64 = 64;
 
 struct Mmap(*mut u8);
 
-#[cfg(target_family = "unix")]
-impl Mmap {
-    fn create_virt_mem(vm_size: u64) -> Result<Mmap> {
-        unsafe {
-            use libc::{
-                mmap, MAP_ANONYMOUS, MAP_FAILED, MAP_NORESERVE, MAP_PRIVATE, PROT_READ, PROT_WRITE,
-            };
-            use std::ptr::null_mut;
-            match mmap(
-                null_mut(),
-                vm_size as usize,
-                PROT_READ | PROT_WRITE,
-                MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
-                -1,
-                0,
-            ) {
-                MAP_FAILED => Err(io::Error::last_os_error().into()),
-                p => Ok(Mmap(p as *mut u8)),
-            }
-        }
-    }
-}
-
-#[cfg(target_family = "windows")]
-impl Mmap {
-    fn create_virt_mem(vm_size: u64) -> Result<Mmap> {
-        use std::ptr::null;
-        unsafe {
-            use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
-            let p = VirtualAlloc(null(), vm_size as usize, MEM_RESERVE, PAGE_READWRITE);
-            if p.is_null() {
-                Err(io::Error::last_os_error().into())
-            } else {
-                Ok(Mmap(p as *mut u8))
-            }
-        }
-    }
-}
-
 impl Mmap {
     unsafe fn to_ptr(&self, pid: PageId) -> *mut u8 {
         self.0.offset(pid.offset() as isize)
@@ -112,7 +85,7 @@ impl Mmap {
         let offset = ptr.offset_from(self.0) as u64;
         PageId::new_offset(page_count, offset & OFFSET_MASK)
     }
-    unsafe fn release(self, pid: PageId) -> Result<()> {
+    unsafe fn release(&self, pid: PageId) -> Result<()> {
         release(self.to_ptr(pid), pid.size())
     }
 }
@@ -123,77 +96,6 @@ trait Pread {
 
 trait Pwrite {
     fn pwrite(&self, buf: *const u8, offset: u64, size: u64) -> Result<u64>;
-}
-
-#[cfg(target_family = "unix")]
-impl Pread for File {
-    fn pread(&self, buf: *mut u8, offset: u64, size: u64) -> Result<u64> {
-        use std::os::unix::fs::FileExt;
-        use std::slice::from_raw_parts_mut;
-        let slice = unsafe { from_raw_parts_mut(buf, size as usize) };
-        self.read_at(slice, offset)
-            .map(|us| us as u64)
-            .map_err(Into::into)
-    }
-}
-
-#[cfg(target_family = "unix")]
-impl Pwrite for File {
-    fn pwrite(&self, buf: *const u8, offset: u64, size: u64) -> Result<u64> {
-        use std::os::unix::fs::FileExt;
-        use std::slice::from_raw_parts;
-        let slice = unsafe { from_raw_parts(buf, size as usize) };
-        self.write_at(slice, offset)
-            .map(|us| us as u64)
-            .map_err(Into::into)
-    }
-}
-
-// Note: Windows will advance the file pointer.
-// A correct implementation of pread/pwrite would reset it.
-// But we always use pread so this isn't an issue.
-#[cfg(target_family = "windows")]
-impl Pread for File {
-    fn pread(&self, buf: *mut u8, offset: u64, size: u64) -> Result<u64> {
-        use std::os::windows::fs::FileExt;
-        use std::slice::from_raw_parts_mut;
-        let slice = unsafe { from_raw_parts_mut(buf, size as usize) };
-        self.seek_read(slice, offset)
-            .map(|us| us as u64)
-            .map_err(Into::into)
-    }
-}
-
-#[cfg(target_family = "windows")]
-impl Pwrite for File {
-    fn pwrite(&self, buf: *const u8, offset: u64, size: u64) -> Result<u64> {
-        use std::os::windows::fs::FileExt;
-        use std::slice::from_raw_parts;
-        let slice = unsafe { from_raw_parts(buf, size as usize) };
-        self.seek_write(slice, offset)
-            .map(|us| us as u64)
-            .map_err(Into::into)
-    }
-}
-
-#[cfg(target_family = "unix")]
-unsafe fn release(buf: *mut u8, size: u64) -> Result<()> {
-    use libc::{madvise, MADV_DONTNEED};
-    if madvise(buf as *mut c_void, size as usize, MADV_DONTNEED) != 0 {
-        Err(io::Error::last_os_error().into())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_family = "windows")]
-unsafe fn release(buf: *mut u8, size: u64) -> Result<()> {
-    use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
-    if VirtualFree(buf as *mut c_void, size as usize, MEM_RELEASE) == 0 {
-        Err(io::Error::last_os_error().into())
-    } else {
-        Ok(())
-    }
 }
 
 // actually, bottom 12 bits will store it.
@@ -242,18 +144,6 @@ impl PageId {
     fn unpack_offset(self) -> (u64, u64) {
         (self.size(), self.offset())
     }
-}
-
-#[cfg(target_family = "unix")]
-fn advise_random_read(f: &File) -> Result<()> {
-    unsafe {
-        use libc::{posix_fadvise, POSIX_FADV_RANDOM};
-        use std::os::unix::io::AsRawFd;
-        if posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_RANDOM) != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -342,7 +232,7 @@ impl Default for PageEntry {
     }
 }
 
-struct PageCache {
+pub struct PageCache {
     mem: Mmap,
     page_state: DashMap<PageId, PageEntry, ahash::RandomState>, // Should the key be PageId or u64?
     f: File,
@@ -433,9 +323,13 @@ impl ResidentSet {
 }
 
 impl PageCache {
-    fn new(f: File, vm_size_bytes: u64, cache_elems: u64) -> Result<PageCache> {
+    pub fn new(f: File, vm_size_bytes: u64, cache_elems: u64) -> Result<PageCache> {
         // hint that we're going to be doing random reads
-        #[cfg(target_family = "unix")]
+        // maybe this should be done outside of new?
+        #[cfg(all(
+            target_family = "unix",
+            not(any(target_os = "macos", target_os = "ios"))
+        ))]
         advise_random_read(&f)?;
         /*
         vmSize = min(
@@ -603,8 +497,7 @@ impl PageCache {
         }
         for page_id in &to_evict {
             unsafe {
-                let buf = self.mem.to_ptr(*page_id);
-                release(buf, page_id.size());
+                self.mem.release(*page_id);
             }
         }
         for page_id in &to_evict {
@@ -627,123 +520,4 @@ fn max_file_size_from_fs_name(fs_name: &str) -> u64 {
         "ext4" => 16 * TB,
         _ => todo!(),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn fs_name_from_f_type(f_type: i64) -> &'static str {
-    match f_type {
-        libc::EXT4_SUPER_MAGIC => "ext4",
-        _ => todo!(),
-    }
-}
-
-// Given a file, obtain the
-// - The size of the disk it's contained on.
-// - The maximum size of a file on the file system it's contained on.
-#[cfg(all(target_family = "unix", not(target_os = "linux")))]
-pub fn get_fs_info(file: &File) -> Result<FsInfo> {
-    use libc::{fstatfs, statfs};
-    use std::{ffi::CStr, mem::MaybeUninit, os::fd::AsRawFd};
-    let mut buf: MaybeUninit<statfs> = MaybeUninit::uninit();
-    unsafe {
-        if fstatfs(file.as_raw_fd(), buf.as_mut_ptr()) != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let st = buf.assume_init();
-        let fs_name = CStr::from_ptr(st.f_fstypename.as_ptr()).to_str()?;
-        let disk_size = st.f_blocks * (st.f_bsize as u64);
-        let max_file_size = max_file_size_from_fs_name(fs_name);
-        Ok(FsInfo {
-            disk_size,
-            max_file_size,
-        })
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub fn get_fs_info(file: &File) -> Result<FsInfo> {
-    use libc::{fstatfs64, statfs64};
-    use std::{mem::MaybeUninit, os::fd::AsRawFd};
-    let mut buf: MaybeUninit<statfs64> = MaybeUninit::uninit();
-    let st = unsafe {
-        if fstatfs64(file.as_raw_fd(), buf.as_mut_ptr()) != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        buf.assume_init()
-    };
-    let disk_size = st.f_blocks * (st.f_bsize as u64);
-    let fsname = fs_name_from_f_type(st.f_type);
-    let max_file_size = max_file_size_from_fs_name(fsname);
-    Ok(FsInfo {
-        disk_size,
-        max_file_size,
-    })
-}
-
-#[cfg(target_family = "windows")]
-pub fn get_fs_info(file: &File) -> Result<FsInfo> {
-    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle, ptr::null_mut};
-    use widestring::U16CStr;
-    use windows_sys::Win32::{
-        Foundation::MAX_PATH,
-        Storage::FileSystem::{
-            GetDiskFreeSpaceExW, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-            VOLUME_NAME_GUID,
-        },
-    };
-    let raw_handle = file.as_raw_handle() as isize;
-    let max_file_size = unsafe {
-        let mut fs_name_buf =
-            MaybeUninit::<[MaybeUninit<u16>; MAX_PATH as usize + 1]>::uninit().assume_init();
-        if GetVolumeInformationByHandleW(
-            raw_handle,
-            null_mut(),
-            0,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            fs_name_buf.as_mut_ptr() as *mut u16,
-            fs_name_buf.len() as u32,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error().into());
-        }
-        let fs_name =
-            U16CStr::from_ptr_truncate(fs_name_buf.as_ptr() as *const u16, fs_name_buf.len())?
-                .to_string()?;
-        max_file_size_from_fs_name(&fs_name)
-    };
-    let disk_size = unsafe {
-        let path_len = GetFinalPathNameByHandleW(raw_handle, null_mut(), 0, VOLUME_NAME_GUID);
-        if path_len == 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let mut path_buf = Box::<[u16]>::new_uninit_slice(path_len as usize);
-        if GetFinalPathNameByHandleW(
-            raw_handle,
-            path_buf.as_mut_ptr() as *mut u16,
-            path_len,
-            VOLUME_NAME_GUID,
-        ) != (path_len - 1)
-        {
-            return Err(io::Error::last_os_error().into());
-        }
-        let mut path_buf = path_buf.assume_init();
-        path_buf[49] = 0; // this is the char after the volume path
-        let mut disk_size = MaybeUninit::<u64>::uninit();
-        if GetDiskFreeSpaceExW(
-            path_buf.as_ptr(),
-            null_mut(),
-            disk_size.as_mut_ptr(),
-            null_mut(),
-        ) == 0
-        {
-            return Err(io::Error::last_os_error().into());
-        }
-        disk_size.assume_init()
-    };
-    Ok(FsInfo {
-        disk_size,
-        max_file_size,
-    })
 }
