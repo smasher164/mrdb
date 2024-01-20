@@ -1,9 +1,12 @@
+#![feature(new_uninit)]
+
 use dashmap::{mapref::one::RefMut, DashMap};
 use init_array::init_boxed_slice;
 use std::{
     fs::File,
     io,
-    sync::atomic::{AtomicU64, Ordering}, str::Utf8Error,
+    str::Utf8Error,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use core::ffi::c_void;
@@ -679,26 +682,23 @@ pub fn get_fs_info(file: &File) -> Result<FsInfo> {
 
 #[cfg(target_family = "windows")]
 pub fn get_fs_info(file: &File) -> Result<FsInfo> {
-    use std::{
-        mem::MaybeUninit,
-        os::windows::io::AsRawHandle,
-        ptr::null_mut,
-    };
-    use widestring::{U16CStr, U16String};
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle, ptr::null_mut};
+    use widestring::U16CStr;
     use windows_sys::Win32::{
         Foundation::MAX_PATH,
-        Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumeInformationByHandleW},
+        Storage::FileSystem::{
+            GetDiskFreeSpaceExW, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+            VOLUME_NAME_GUID,
+        },
     };
     let raw_handle = file.as_raw_handle() as isize;
-    unsafe {
-        let mut vol_name_buf =
-            MaybeUninit::<[MaybeUninit<u16>; MAX_PATH as usize + 1]>::uninit().assume_init();
+    let max_file_size = unsafe {
         let mut fs_name_buf =
             MaybeUninit::<[MaybeUninit<u16>; MAX_PATH as usize + 1]>::uninit().assume_init();
         if GetVolumeInformationByHandleW(
             raw_handle,
-            vol_name_buf.as_mut_ptr() as *mut u16,
-            vol_name_buf.len() as u32,
+            null_mut(),
+            0,
             null_mut(),
             null_mut(),
             null_mut(),
@@ -708,11 +708,31 @@ pub fn get_fs_info(file: &File) -> Result<FsInfo> {
         {
             return Err(io::Error::last_os_error().into());
         }
-        let vol_name = U16CStr::from_ptr_truncate(vol_name_buf.as_ptr() as *const u16, vol_name_buf.len())?;
-        let dir_name = U16String::from_str(&format!(r#"\\?\Volume{}\"#, vol_name.display()));
+        let fs_name =
+            U16CStr::from_ptr_truncate(fs_name_buf.as_ptr() as *const u16, fs_name_buf.len())?
+                .to_string()?;
+        max_file_size_from_fs_name(&fs_name)
+    };
+    let disk_size = unsafe {
+        let path_len = GetFinalPathNameByHandleW(raw_handle, null_mut(), 0, VOLUME_NAME_GUID);
+        if path_len == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let mut path_buf = Box::<[u16]>::new_uninit_slice(path_len as usize);
+        if GetFinalPathNameByHandleW(
+            raw_handle,
+            path_buf.as_mut_ptr() as *mut u16,
+            path_len,
+            VOLUME_NAME_GUID,
+        ) != (path_len - 1)
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        let mut path_buf = path_buf.assume_init();
+        path_buf[49] = 0; // this is the char after the volume path
         let mut disk_size = MaybeUninit::<u64>::uninit();
         if GetDiskFreeSpaceExW(
-            dir_name.as_ptr(),
+            path_buf.as_ptr(),
             null_mut(),
             disk_size.as_mut_ptr(),
             null_mut(),
@@ -720,13 +740,10 @@ pub fn get_fs_info(file: &File) -> Result<FsInfo> {
         {
             return Err(io::Error::last_os_error().into());
         }
-        let disk_size = disk_size.assume_init();
-        let fs_name =
-            U16CStr::from_ptr_truncate(fs_name_buf.as_ptr() as *const u16, fs_name_buf.len())?.to_string()?;
-        let max_file_size = max_file_size_from_fs_name(&fs_name);
-        Ok(FsInfo {
-            disk_size,
-            max_file_size,
-        })
-    }
+        disk_size.assume_init()
+    };
+    Ok(FsInfo {
+        disk_size,
+        max_file_size,
+    })
 }
