@@ -3,8 +3,10 @@
 use dashmap::{mapref::one::RefMut, DashMap};
 use init_array::init_boxed_slice;
 use std::{
+    cmp::min,
     fs::File,
     io,
+    path::Path,
     str::Utf8Error,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -169,6 +171,12 @@ impl PageState {
     fn is_dirty(x: u64) -> bool {
         (x & DIRTY_BIT_MASK) != 0
     }
+    fn set_dirty(x: u64) -> u64 {
+        x | DIRTY_BIT_MASK
+    }
+    fn set_clean(x: u64) -> u64 {
+        x | (!DIRTY_BIT_MASK)
+    }
 }
 
 struct PageEntry(AtomicU64); // TODO: maybe we'll need a dirty bit for logging
@@ -224,6 +232,14 @@ impl PageEntry {
     fn mark(&self, old: u64) -> bool {
         self.cas(old, PageState::set(old, PageState::MARKED))
     }
+    fn mark_clean(&self) {
+        loop {
+            let old = self.0.load(Ordering::SeqCst);
+            if self.cas_weak(old, PageState::set_clean(old)) {
+                return;
+            }
+        }
+    }
 }
 
 impl Default for PageEntry {
@@ -245,6 +261,7 @@ struct ResidentSet {
     rand_state: ahash::RandomState,
     mask: u64,
     used: AtomicU64,
+    capacity: u64,
 }
 
 impl ResidentSet {
@@ -364,6 +381,7 @@ impl PageCache {
         self.f.pread(buf, offset, size)
     }
     unsafe fn write_page(&self, page_id: PageId) -> Result<u64> {
+        // should unset dirty bit.
         let m = self.mem.to_slice_mut(page_id);
         m[0] = 0;
         let buf = self.mem.to_ptr(page_id);
@@ -461,6 +479,7 @@ impl PageCache {
                 let old = entry.0.load(Ordering::SeqCst);
                 match PageState::get(old) {
                     PageState::MARKED => {
+                        // if it's marked, we evict
                         if PageState::is_dirty(old) {
                             if entry.lock_shared(old) {
                                 to_write.push(page_id);
@@ -470,6 +489,7 @@ impl PageCache {
                         }
                     }
                     PageState::UNLOCKED => {
+                        // if it's unmarked, we mark it and wait till we wrap around
                         entry.mark(old);
                     }
                     _ => (),
@@ -486,6 +506,7 @@ impl PageCache {
         });
         for page_id in &to_write {
             let entry = self.get_page_entry(*page_id);
+            entry.mark_clean(); // unset dirty bit. we do it here since we already got the entry.
             let old = entry.0.load(Ordering::SeqCst);
             if PageState::get(old) == PageState::LOCK_MIN
                 && entry.cas_weak(old, PageState::set(old, PageState::LOCKED))
@@ -520,4 +541,27 @@ fn max_file_size_from_fs_name(fs_name: &str) -> u64 {
         "ext4" => 16 * TB,
         _ => todo!(),
     }
+}
+
+// not sure what we return here. probably some db object.
+fn open_db(path: &Path) -> Result<()> {
+    let f = File::create(path)?;
+    let inf = get_fs_info(&f)?;
+    // maybe advise random reads here?
+    /*        vmSize = min(
+        MAX_PAGES * PAGE_SIZE,
+        MAX_PAGES_LARGE * PAGE_SIZE,
+        disk_size,
+        max_file_size,
+    )
+    count = vmSize / PAGE_SIZE */
+    let vm_size_bytes = (MAX_PAGES * PAGE_SIZE)
+        .min(MAX_PAGES_LARGE * PAGE_SIZE)
+        .min(inf.disk_size)
+        .min(inf.max_file_size);
+    // cache elems 
+    // variable size 63.984375 mb
+    // 
+    PageCache::new(vm_size_bytes, _);
+    Ok(())
 }
