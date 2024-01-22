@@ -3,7 +3,6 @@
 use dashmap::{mapref::one::RefMut, DashMap};
 use init_array::init_boxed_slice;
 use std::{
-    cmp::min,
     fs::File,
     io,
     path::Path,
@@ -58,6 +57,8 @@ const MAX_PAGES: u64 = 1 << 52;
 const MAX_PAGES_LARGE: u64 = 1 << 40;
 const DIRTY_BIT_MASK: u64 = 1 << (57 - 1);
 const BATCH_SIZE: u64 = 64;
+const BATCH_SPACE: u64 = BATCH_SIZE * 4096;
+const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 64 * MB;
 
 // TODO: use async i/o for disk reads and writes instead of pread/pwrite.
 
@@ -229,6 +230,11 @@ impl PageEntry {
         let new = PageState::inc(self.0.load(Ordering::SeqCst), PageState::EVICTED);
         self.0.store(new, Ordering::Release);
     }
+    fn rollback_evicted(&self) {
+        // assumes it was locked.
+        let new = PageState::set(self.0.load(Ordering::SeqCst), PageState::EVICTED);
+        self.0.store(new, Ordering::Release); // okay for this to be release?
+    }
     fn mark(&self, old: u64) -> bool {
         self.cas(old, PageState::set(old, PageState::MARKED))
     }
@@ -248,36 +254,32 @@ impl Default for PageEntry {
     }
 }
 
-pub struct PageCache {
-    mem: Mmap,
-    page_state: DashMap<PageId, PageEntry, ahash::RandomState>, // Should the key be PageId or u64?
-    f: File,
-    residents: ResidentSet,
-}
-
 struct ResidentSet {
     hand: AtomicU64,
     entries: Box<[AtomicU64]>,
     rand_state: ahash::RandomState,
     mask: u64,
-    used: AtomicU64,
+    used_space: AtomicU64,
     capacity: u64,
 }
 
 impl ResidentSet {
-    fn new(size: u64) -> ResidentSet {
-        let size = ((size as f64 * 1.5) as u64).next_power_of_two();
+    fn new(capacity: u64) -> ResidentSet {
+        let capacity = capacity.next_multiple_of(4096);
+        let n_entries = capacity / 4096;
+        let size = ((n_entries as f64 * 1.5) as u64).next_power_of_two(); // is this necessary?
         let mask = size - 1;
         let hand = AtomicU64::new(0);
         let entries = init_boxed_slice(size as usize, |_| AtomicU64::new(0));
         let rand_state = ahash::RandomState::new();
-        let used = AtomicU64::new(0);
+        let used_space = AtomicU64::new(0);
         ResidentSet {
             hand,
             entries,
             mask,
             rand_state,
-            used,
+            used_space,
+            capacity,
         }
     }
     fn insert(&self, page_id: PageId) {
@@ -289,7 +291,7 @@ impl ResidentSet {
                     .compare_exchange(curr.0, page_id.0, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    self.used.fetch_add(1, Ordering::SeqCst);
+                    self.used_space.fetch_add(page_id.size(), Ordering::SeqCst);
                     return;
                 }
             }
@@ -309,7 +311,7 @@ impl ResidentSet {
                     .compare_exchange(curr.0, TOMBSTONE, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    self.used.fetch_sub(1, Ordering::SeqCst);
+                    self.used_space.fetch_sub(page_id.size(), Ordering::SeqCst);
                     return true;
                 }
             }
@@ -339,28 +341,19 @@ impl ResidentSet {
     }
 }
 
+pub struct PageCache {
+    mem: Mmap,
+    page_state: DashMap<PageId, PageEntry, ahash::RandomState>,
+    f: File,
+    residents: ResidentSet,
+}
+
 impl PageCache {
-    pub fn new(f: File, vm_size_bytes: u64, cache_elems: u64) -> Result<PageCache> {
-        // hint that we're going to be doing random reads
-        // maybe this should be done outside of new?
-        #[cfg(all(
-            target_family = "unix",
-            not(any(target_os = "macos", target_os = "ios"))
-        ))]
-        advise_random_read(&f)?;
-        /*
-        vmSize = min(
-            MAX_PAGES * PAGE_SIZE,
-            MAX_PAGES_LARGE * PAGE_SIZE,
-            disk_size,
-            max_file_size,
-        )
-        count = vmSize / PAGE_SIZE
-        */
+    fn new(f: File, vm_size_bytes: u64, cache_capacity_bytes: u64) -> Result<PageCache> {
         let mem = Mmap::create_virt_mem(vm_size_bytes)?;
         let ahasher = ahash::RandomState::new();
         let page_state = DashMap::with_hasher(ahasher);
-        let residents = ResidentSet::new(cache_elems);
+        let residents = ResidentSet::new(cache_capacity_bytes);
         Ok(PageCache {
             mem,
             page_state,
@@ -389,11 +382,11 @@ impl PageCache {
         let size = page_id.size();
         self.f.pwrite(buf, offset, size)
     }
-    fn ensure_free_pages(&self) {
-        if (1 + self.residents.used.load(Ordering::SeqCst))
-            >= (((self.residents.entries.len() as f64) * 0.95) as u64)
+    fn ensure_free_pages(&self, size: u64) {
+        if (size + self.residents.used_space.load(Ordering::SeqCst))
+            >= (((self.residents.capacity as f64) * 0.95) as u64)
         {
-            self.evict();
+            self.evict(size);
         }
     }
     // fn readpg(self, pid: PageId) -> *mut u8 {
@@ -405,7 +398,14 @@ impl PageCache {
     // unsafe fn write_page(self, pid: PageId, offset: u64) -> Result<usize> {
     //     self.f.pwrite(self.mem.to_ptr(pid), offset)
     // }
-    unsafe fn fix(&self, page_id: PageId) -> Result<()> {
+
+    unsafe fn handle_fault(&self, page_id: PageId) -> Result<()> {
+        self.ensure_free_pages(page_id.size());
+        self.read_page(page_id)?;
+        self.residents.insert(page_id);
+        Ok(())
+    }
+    unsafe fn fix_write(&self, page_id: PageId) -> Result<*mut u8> {
         let entry = self.get_page_entry(page_id);
         loop {
             let old = entry.0.load(Ordering::SeqCst);
@@ -415,29 +415,68 @@ impl PageCache {
                     if entry.lock_weak(old) {
                         // ensure there's enough space to read this page
                         // then actually read it.
-                        self.ensure_free_pages();
-                        self.read_page(page_id)?;
-                        self.residents.insert(page_id);
-                        return Ok(());
-                        // return self.mem.to_slice(page_id) // do we want read or write?
+                        match self.handle_fault(page_id) {
+                            Ok(_) => {
+                                entry.unlock();
+                                // return actual write pointer to page
+                                return Ok(self.mem.to_ptr(page_id))
+                            },
+                            Err(e) => {
+                                entry.rollback_evicted();
+                                return Err(e);
+                            },
+                        }
+                        
                     }
                 }
                 PageState::MARKED | PageState::UNLOCKED => {
                     // cache hit
                     if entry.lock_weak(old) {
-                        return Ok(());
-                        // return self.mem.to_slice(page_id) // do we want read or write?
+                        return Ok(self.mem.to_ptr(page_id));
                     }
                 }
                 _ => (),
             }
         }
     }
-    fn unfix(&self, page_id: PageId) {
+    fn unfix_write(&self, page_id: PageId) {
+        self.get_page_entry(page_id).unlock()
+    }
+    fn unfix_read(&self, page_id: PageId) {
+        self.get_page_entry(page_id).unlock_shared()
+    }
+    unsafe fn fix_read(&self, page_id: PageId) -> Result<*const u8> {
         let entry = self.get_page_entry(page_id);
-        let old = entry.0.load(Ordering::SeqCst);
-        let new = PageState::inc(old, PageState::UNLOCKED);
-        entry.0.store(new, Ordering::Release);
+        loop {
+            let old = entry.0.load(Ordering::SeqCst);
+            match PageState::get(old) {
+                PageState::LOCKED => (),
+                PageState::EVICTED => {
+                    if entry.lock(old) {
+                        // handle fault
+                        // TODO: okay to short-circuit on failure to read? should probably reset to evicted.
+                        // that's safe to do because we have an exclusive lock here.
+                        match self.handle_fault(page_id) {
+                            Ok(_) => {
+                                entry.unlock();
+                                // return actual pointer to page
+                                return Ok(self.mem.to_ptr(page_id) as *const u8)
+                            },
+                            Err(e) => {
+                                entry.rollback_evicted();
+                                return Err(e);
+                            },
+                        }
+                    }
+                }
+                _ => {
+                    if entry.lock_shared(old) {
+                        // return shared ref to page
+                        return Ok(self.mem.to_ptr(page_id) as *const u8);
+                    }
+                }
+            }
+        }
     }
     unsafe fn optimistic_read<F>(&self, page_id: PageId, f: F)
     where
@@ -461,8 +500,8 @@ impl PageCache {
                     entry.cas_weak(old, new);
                 }
                 PageState::EVICTED => {
-                    self.fix(page_id);
-                    self.unfix(page_id);
+                    self.fix_write(page_id);
+                    self.unfix_write(page_id);
                 }
                 _ => (),
             }
@@ -470,10 +509,12 @@ impl PageCache {
     }
     // eviction based on CLOCK, but consider trying SIEVE
     // https://cachemon.github.io/SIEVE-website/blog/2023/12/17/sieve-is-simpler-than-lru/
-    fn evict(&self) {
+    fn evict(&self, required_size: u64) {
         let mut to_evict: Vec<PageId> = Vec::with_capacity(BATCH_SIZE as usize);
         let mut to_write: Vec<PageId> = Vec::with_capacity(BATCH_SIZE as usize);
-        while ((to_evict.len() + to_write.len()) as u64) < BATCH_SIZE {
+        let mut total_size : u64 = 0;
+        let needed = required_size.max(BATCH_SPACE);
+        while total_size < needed {
             if let Some(page_id) = self.residents.next() {
                 let entry = self.get_page_entry(page_id);
                 let old = entry.0.load(Ordering::SeqCst);
@@ -483,9 +524,11 @@ impl PageCache {
                         if PageState::is_dirty(old) {
                             if entry.lock_shared(old) {
                                 to_write.push(page_id);
+                                total_size += page_id.size();
                             }
                         } else {
                             to_evict.push(page_id);
+                            total_size += page_id.size();
                         }
                     }
                     PageState::UNLOCKED => {
@@ -497,7 +540,7 @@ impl PageCache {
             }
         }
         for page_id in &to_write {
-            unsafe { self.write_page(*page_id) }; // TODO: make this async
+            unsafe { self.write_page(*page_id) }; // TODO: make this async and handle write error. probably log?
         }
         to_evict.retain(|page_id| {
             let entry = self.get_page_entry(*page_id);
@@ -518,7 +561,7 @@ impl PageCache {
         }
         for page_id in &to_evict {
             unsafe {
-                self.mem.release(*page_id);
+                self.mem.release(*page_id); // gotta handle the release error somehow. probably log?
             }
         }
         for page_id in &to_evict {
@@ -544,24 +587,24 @@ fn max_file_size_from_fs_name(fs_name: &str) -> u64 {
 }
 
 // not sure what we return here. probably some db object.
-fn open_db(path: &Path) -> Result<()> {
+pub fn open_db(path: &Path) -> Result<PageCache> {
+    // create db if it does not exist.
     let f = File::create(path)?;
+
+    // hint that we're going to be doing random reads on this file
+    #[cfg(all(
+        target_family = "unix",
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
+    advise_random_read(&f)?;
+
+    // get info about its respective disk's size and maximum supported file size
     let inf = get_fs_info(&f)?;
-    // maybe advise random reads here?
-    /*        vmSize = min(
-        MAX_PAGES * PAGE_SIZE,
-        MAX_PAGES_LARGE * PAGE_SIZE,
-        disk_size,
-        max_file_size,
-    )
-    count = vmSize / PAGE_SIZE */
+
+    // the limit of our virtual memory mapping
     let vm_size_bytes = (MAX_PAGES * PAGE_SIZE)
         .min(MAX_PAGES_LARGE * PAGE_SIZE)
         .min(inf.disk_size)
         .min(inf.max_file_size);
-    // cache elems 
-    // variable size 63.984375 mb
-    // 
-    PageCache::new(vm_size_bytes, _);
-    Ok(())
+    PageCache::new(f, vm_size_bytes, DEFAULT_CACHE_CAPACITY_BYTES)
 }
