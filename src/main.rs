@@ -1,4 +1,4 @@
-use std::{fs::File, mem::MaybeUninit, ffi::CStr};
+use std::{fs::File, mem::MaybeUninit, ffi::CStr, path::Path};
 
 use mrdb;
 // use widestring::U16CStr;
@@ -33,5 +33,8 @@ fn main() {
     let f = File::open("/home/akhil/Projects/mrdb/README.md").unwrap();
     let fs_info = mrdb::get_fs_info(&f).unwrap();
     println!("{:?}", fs_info);
+    let db = mrdb::open_db(Path::new("hola")).unwrap();
+    let pid = mrdb::PageId::new_pid(1, 0);
+    let pg = db.write_page(pid).unwrap();
     
 }

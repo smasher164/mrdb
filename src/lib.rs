@@ -1,10 +1,11 @@
 #![feature(new_uninit)]
 
-use dashmap::{mapref::one::RefMut, DashMap};
+use dashmap::{mapref::one::Ref, DashMap};
 use init_array::init_boxed_slice;
 use std::{
     fs::File,
     io,
+    ops::{Deref, DerefMut},
     path::Path,
     str::Utf8Error,
     sync::atomic::{AtomicU64, Ordering},
@@ -103,48 +104,48 @@ trait Pwrite {
 
 // actually, bottom 12 bits will store it.
 #[derive(Hash, PartialEq, Eq, Copy, Clone)]
-struct PageId(u64);
+pub struct PageId(u64);
 impl PageId {
-    fn is_empty(self) -> bool {
+    pub fn is_empty(self) -> bool {
         self.page_count() == 0
     }
-    fn is_tombstone(self) -> bool {
+    pub fn is_tombstone(self) -> bool {
         self.page_count() == 0xFFF
     }
     // should this return a u16?
-    fn page_count(self) -> u64 {
+    pub fn page_count(self) -> u64 {
         let n = (self.0 & PAGE_COUNT_MASK); // no longer +1, because when cleared it's empty.
         n // for now, keep it simple.
-          // n*n*n // 1, 8, 27, ...
+          // maybe we can do n*n*n in the future (1, 8, 27, ...)
     }
-    fn size(self) -> u64 {
+    pub fn size(self) -> u64 {
         self.page_count() * PAGE_SIZE // 4K,32K,81K,256K,500K,864K,1372K,..256TB
     }
-    fn pid(self) -> u64 {
+    pub fn pid(self) -> u64 {
         (self.0 & PID_MASK) >> 12
     }
-    fn offset(self) -> u64 {
+    pub fn offset(self) -> u64 {
         self.pid() * PAGE_SIZE
     }
-    fn new_pid(page_count: u64, pid: u64) -> Self {
+    pub fn new_pid(page_count: u64, pid: u64) -> Self {
         Self((pid << 12) | (page_count - 1))
     }
-    fn new_size_pid(size: u64, pid: u64) -> Self {
+    pub fn new_size_pid(size: u64, pid: u64) -> Self {
         let page_count = size / PAGE_SIZE;
         Self::new_pid(page_count, pid)
     }
-    fn new_offset(page_count: u64, offset: u64) -> Self {
+    pub fn new_offset(page_count: u64, offset: u64) -> Self {
         let pid = offset / PAGE_SIZE;
-        Self::new_pid(page_count, offset)
+        Self::new_pid(page_count, pid)
     }
-    fn new_size_offset(size: u64, offset: u64) -> Self {
+    pub fn new_size_offset(size: u64, offset: u64) -> Self {
         let page_count = size / PAGE_SIZE;
         Self::new_offset(page_count, offset)
     }
-    fn unpack(self) -> (u64, u64) {
+    pub fn unpack(self) -> (u64, u64) {
         (self.size(), self.pid())
     }
-    fn unpack_offset(self) -> (u64, u64) {
+    pub fn unpack_offset(self) -> (u64, u64) {
         (self.size(), self.offset())
     }
 }
@@ -180,7 +181,7 @@ impl PageState {
     }
 }
 
-struct PageEntry(AtomicU64); // TODO: maybe we'll need a dirty bit for logging
+struct PageEntry(AtomicU64);
 impl PageEntry {
     fn new() -> PageEntry {
         PageEntry(AtomicU64::new(PageState::EVICTED.0 << 56))
@@ -246,6 +247,9 @@ impl PageEntry {
             }
         }
     }
+    fn is_locked(&self) -> bool {
+        PageState::get(self.0.load(Ordering::SeqCst)) == PageState::LOCKED
+    }
 }
 
 impl Default for PageEntry {
@@ -254,6 +258,7 @@ impl Default for PageEntry {
     }
 }
 
+// TODO: replace this with a ring.
 struct ResidentSet {
     hand: AtomicU64,
     entries: Box<[AtomicU64]>,
@@ -349,7 +354,14 @@ pub struct PageCache {
 }
 
 impl PageCache {
-    fn new(f: File, vm_size_bytes: u64, cache_capacity_bytes: u64) -> Result<PageCache> {
+    pub fn new(f: File, vm_size_bytes: u64, cache_capacity_bytes: u64) -> Result<PageCache> {
+        // hint that we're going to be doing random reads on this file
+        #[cfg(all(
+            target_family = "unix",
+            not(any(target_os = "macos", target_os = "ios"))
+        ))]
+        advise_random_read(&f)?;
+
         let mem = Mmap::create_virt_mem(vm_size_bytes)?;
         let ahasher = ahash::RandomState::new();
         let page_state = DashMap::with_hasher(ahasher);
@@ -361,22 +373,20 @@ impl PageCache {
             residents,
         })
     }
-    fn get_page_entry(&self, page_id: PageId) -> RefMut<'_, PageId, PageEntry, ahash::RandomState> {
+    fn get_page_entry(&self, page_id: PageId) -> Ref<'_, PageId, PageEntry, ahash::RandomState> {
         // &self.page_state[page_id.pid() as usize]
         let entry = self.page_state.entry(page_id);
         let or_def = entry.or_default();
-        or_def
+        or_def.downgrade()
     }
-    unsafe fn read_page(&self, page_id: PageId) -> Result<u64> {
+    unsafe fn disk_read_page(&self, page_id: PageId) -> Result<u64> {
         let buf = self.mem.to_ptr(page_id);
         let offset = page_id.offset();
         let size = page_id.size();
         self.f.pread(buf, offset, size)
     }
-    unsafe fn write_page(&self, page_id: PageId) -> Result<u64> {
-        // should unset dirty bit.
-        let m = self.mem.to_slice_mut(page_id);
-        m[0] = 0;
+    unsafe fn disk_write_page(&self, page_id: PageId) -> Result<u64> {
+        // let m = self.mem.to_slice_mut(page_id);
         let buf = self.mem.to_ptr(page_id);
         let offset = page_id.offset();
         let size = page_id.size();
@@ -389,23 +399,13 @@ impl PageCache {
             self.evict(size);
         }
     }
-    // fn readpg(self, pid: PageId) -> *mut u8 {
-    //     pid.0
-    // }
-    // unsafe fn read_page(self, pid: PageId, offset: u64) -> Result<usize> {
-    //     self.f.pread(self.mem.to_ptr(pid), offset)
-    // }
-    // unsafe fn write_page(self, pid: PageId, offset: u64) -> Result<usize> {
-    //     self.f.pwrite(self.mem.to_ptr(pid), offset)
-    // }
-
     unsafe fn handle_fault(&self, page_id: PageId) -> Result<()> {
         self.ensure_free_pages(page_id.size());
-        self.read_page(page_id)?;
+        self.disk_read_page(page_id)?;
         self.residents.insert(page_id);
         Ok(())
     }
-    unsafe fn fix_write(&self, page_id: PageId) -> Result<*mut u8> {
+    pub fn write_page(&self, page_id: PageId) -> Result<PageMut> {
         let entry = self.get_page_entry(page_id);
         loop {
             let old = entry.0.load(Ordering::SeqCst);
@@ -415,24 +415,34 @@ impl PageCache {
                     if entry.lock_weak(old) {
                         // ensure there's enough space to read this page
                         // then actually read it.
-                        match self.handle_fault(page_id) {
+                        match unsafe { self.handle_fault(page_id) } {
                             Ok(_) => {
-                                entry.unlock();
                                 // return actual write pointer to page
-                                return Ok(self.mem.to_ptr(page_id))
-                            },
+                                let slice = unsafe { self.mem.to_slice_mut(page_id) };
+                                let pg = PageMut {
+                                    page_entry: entry,
+                                    data: slice,
+                                };
+                                return Ok(pg);
+                                // return Ok(unsafe { self.mem.to_ptr(page_id) })
+                            }
                             Err(e) => {
                                 entry.rollback_evicted();
                                 return Err(e);
-                            },
+                            }
                         }
-                        
                     }
                 }
                 PageState::MARKED | PageState::UNLOCKED => {
                     // cache hit
                     if entry.lock_weak(old) {
-                        return Ok(self.mem.to_ptr(page_id));
+                        let slice = unsafe { self.mem.to_slice_mut(page_id) };
+                        let pg = PageMut {
+                            page_entry: entry,
+                            data: slice,
+                        };
+                        return Ok(pg);
+                        // return Ok(unsafe { self.mem.to_ptr(page_id) });
                     }
                 }
                 _ => (),
@@ -445,7 +455,9 @@ impl PageCache {
     fn unfix_read(&self, page_id: PageId) {
         self.get_page_entry(page_id).unlock_shared()
     }
-    unsafe fn fix_read(&self, page_id: PageId) -> Result<*const u8> {
+    // fn read(&self, page_id: PageId) -> &Page<'_> {
+    // }
+    pub fn read_page(&self, page_id: PageId) -> Result<Page> {
         let entry = self.get_page_entry(page_id);
         loop {
             let old = entry.0.load(Ordering::SeqCst);
@@ -456,23 +468,35 @@ impl PageCache {
                         // handle fault
                         // TODO: okay to short-circuit on failure to read? should probably reset to evicted.
                         // that's safe to do because we have an exclusive lock here.
-                        match self.handle_fault(page_id) {
+                        match unsafe { self.handle_fault(page_id) } {
                             Ok(_) => {
                                 entry.unlock();
                                 // return actual pointer to page
-                                return Ok(self.mem.to_ptr(page_id) as *const u8)
-                            },
+                                let slice = unsafe { self.mem.to_slice(page_id) };
+                                let pg = Page {
+                                    page_entry: entry,
+                                    data: slice,
+                                };
+                                return Ok(pg);
+                                // return Ok(self.mem.to_ptr(page_id) as *const u8)
+                            }
                             Err(e) => {
                                 entry.rollback_evicted();
                                 return Err(e);
-                            },
+                            }
                         }
                     }
                 }
                 _ => {
                     if entry.lock_shared(old) {
                         // return shared ref to page
-                        return Ok(self.mem.to_ptr(page_id) as *const u8);
+                        let slice = unsafe { self.mem.to_slice(page_id) };
+                        let pg = Page {
+                            page_entry: entry,
+                            data: slice,
+                        };
+                        return Ok(pg);
+                        // return Ok(self.mem.to_ptr(page_id) as *const u8);
                     }
                 }
             }
@@ -500,7 +524,7 @@ impl PageCache {
                     entry.cas_weak(old, new);
                 }
                 PageState::EVICTED => {
-                    self.fix_write(page_id);
+                    self.write_page(page_id);
                     self.unfix_write(page_id);
                 }
                 _ => (),
@@ -512,7 +536,7 @@ impl PageCache {
     fn evict(&self, required_size: u64) {
         let mut to_evict: Vec<PageId> = Vec::with_capacity(BATCH_SIZE as usize);
         let mut to_write: Vec<PageId> = Vec::with_capacity(BATCH_SIZE as usize);
-        let mut total_size : u64 = 0;
+        let mut total_size: u64 = 0;
         let needed = required_size.max(BATCH_SPACE);
         while total_size < needed {
             if let Some(page_id) = self.residents.next() {
@@ -520,15 +544,24 @@ impl PageCache {
                 let old = entry.0.load(Ordering::SeqCst);
                 match PageState::get(old) {
                     PageState::MARKED => {
-                        // if it's marked, we evict
+                        // if it's marked, we evict if we can grab a lock on the page
                         if PageState::is_dirty(old) {
-                            if entry.lock_shared(old) {
+                            // if entry.lock_shared(old) {
+                            if entry.lock(old) {
                                 to_write.push(page_id);
                                 total_size += page_id.size();
+                                // this does mean that size checks will allow insertion to proceed
+                                // but it means this can be turned into a pop()
+                                self.residents.remove(page_id);
                             }
                         } else {
-                            to_evict.push(page_id);
-                            total_size += page_id.size();
+                            if entry.lock(old) {
+                                to_evict.push(page_id);
+                                total_size += page_id.size();
+                                // this does mean that size checks will allow insertion to proceed
+                                // but it means this can be turned into a pop()
+                                self.residents.remove(page_id);
+                            }
                         }
                     }
                     PageState::UNLOCKED => {
@@ -540,24 +573,10 @@ impl PageCache {
             }
         }
         for page_id in &to_write {
-            unsafe { self.write_page(*page_id) }; // TODO: make this async and handle write error. probably log?
-        }
-        to_evict.retain(|page_id| {
+            unsafe { self.disk_write_page(*page_id) }; // TODO: make this async and handle write error. probably log?
             let entry = self.get_page_entry(*page_id);
-            let old = entry.0.load(Ordering::SeqCst);
-            PageState::get(old) == PageState::MARKED && entry.lock(old)
-        });
-        for page_id in &to_write {
-            let entry = self.get_page_entry(*page_id);
-            entry.mark_clean(); // unset dirty bit. we do it here since we already got the entry.
-            let old = entry.0.load(Ordering::SeqCst);
-            if PageState::get(old) == PageState::LOCK_MIN
-                && entry.cas_weak(old, PageState::set(old, PageState::LOCKED))
-            {
-                to_evict.push(*page_id);
-            } else {
-                entry.unlock_shared();
-            }
+            entry.mark_clean();
+            to_evict.push(*page_id);
         }
         for page_id in &to_evict {
             unsafe {
@@ -565,7 +584,6 @@ impl PageCache {
             }
         }
         for page_id in &to_evict {
-            self.residents.remove(*page_id);
             let entry = self.get_page_entry(*page_id);
             entry.unlock_evicted();
         }
@@ -591,20 +609,54 @@ pub fn open_db(path: &Path) -> Result<PageCache> {
     // create db if it does not exist.
     let f = File::create(path)?;
 
-    // hint that we're going to be doing random reads on this file
-    #[cfg(all(
-        target_family = "unix",
-        not(any(target_os = "macos", target_os = "ios"))
-    ))]
-    advise_random_read(&f)?;
-
     // get info about its respective disk's size and maximum supported file size
     let inf = get_fs_info(&f)?;
 
     // the limit of our virtual memory mapping
-    let vm_size_bytes = (MAX_PAGES * PAGE_SIZE)
-        .min(MAX_PAGES_LARGE * PAGE_SIZE)
-        .min(inf.disk_size)
-        .min(inf.max_file_size);
+    let vm_size_bytes = MAX_PAGES_LARGE * PAGE_SIZE.min(inf.disk_size).min(inf.max_file_size);
     PageCache::new(f, vm_size_bytes, DEFAULT_CACHE_CAPACITY_BYTES)
+}
+
+pub struct Page<'a, 'b> {
+    page_entry: Ref<'a, PageId, PageEntry, ahash::RandomState>,
+    data: &'b [u8],
+}
+
+impl Deref for Page<'_, '_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for Page<'_, '_> {
+    fn drop(&mut self) {
+        self.page_entry.unlock_shared()
+    }
+}
+
+pub struct PageMut<'a, 'b> {
+    page_entry: Ref<'a, PageId, PageEntry, ahash::RandomState>,
+    data: &'b mut [u8],
+}
+
+impl Deref for PageMut<'_, '_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl DerefMut for PageMut<'_, '_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+}
+
+impl Drop for PageMut<'_, '_> {
+    fn drop(&mut self) {
+        self.page_entry.unlock()
+    }
 }
