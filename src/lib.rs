@@ -248,6 +248,14 @@ impl PageEntry {
             }
         }
     }
+    fn mark_dirty(&self) {
+        loop {
+            let old = self.0.load(Ordering::SeqCst);
+            if self.cas_weak(old, PageState::set_dirty(old)) {
+                return;
+            }
+        }
+    }
     fn is_locked(&self) -> bool {
         PageState::get(self.0.load(Ordering::SeqCst)) == PageState::LOCKED
     }
@@ -649,6 +657,7 @@ impl Deref for PageMut<'_, '_> {
 
 impl DerefMut for PageMut<'_, '_> {
     fn deref_mut(&mut self) -> &mut [u8] {
+        self.page_entry.mark_dirty();
         &mut self.data
     }
 }
