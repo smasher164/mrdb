@@ -16,7 +16,6 @@ use thiserror::Error;
 #[cfg_attr(target_family = "unix", path = "os_unix.rs")]
 #[cfg_attr(target_family = "windows", path = "os_windows.rs")]
 mod os;
-pub use os::*;
 
 #[cfg_attr(target_os = "linux", path = "fsinfo_linux.rs")]
 #[cfg_attr(
@@ -25,7 +24,6 @@ pub use os::*;
 )]
 #[cfg_attr(target_family = "windows", path = "fsinfo_windows.rs")]
 mod fsinfo;
-pub use fsinfo::*;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -93,7 +91,7 @@ impl Mmap {
         PageId::new_offset(page_count, offset & OFFSET_MASK)
     }
     unsafe fn release(&self, pid: PageId) -> Result<()> {
-        release(self.to_ptr(pid), pid.size())
+        os::release(self.to_ptr(pid), pid.size())
     }
 }
 
@@ -363,7 +361,7 @@ impl PageCache {
             target_family = "unix",
             not(any(target_os = "macos", target_os = "ios"))
         ))]
-        advise_random_read(&f)?;
+        os::advise_random_read(&f)?;
 
         let mem = Mmap::create_virt_mem(vm_size_bytes)?;
         let ahasher = ahash::RandomState::new();
@@ -591,7 +589,7 @@ impl PageCache {
 }
 
 #[derive(Debug)]
-pub struct FsInfo {
+struct FsInfo {
     disk_size: u64,
     max_file_size: u64,
 }
@@ -610,7 +608,7 @@ pub fn open_db(path: &Path) -> Result<PageCache> {
     let f = File::create(path)?;
 
     // get info about its respective disk's size and maximum supported file size
-    let inf = get_fs_info(&f)?;
+    let inf = fsinfo::get_fs_info(&f)?;
 
     // the limit of our virtual memory mapping
     let vm_size_bytes = MAX_PAGES_LARGE * PAGE_SIZE.min(inf.disk_size).min(inf.max_file_size);
