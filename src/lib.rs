@@ -60,8 +60,11 @@ const DIRTY_BIT_MASK: u64 = 1 << (57 - 1);
 const BATCH_SIZE: u64 = 64;
 const BATCH_SPACE: u64 = BATCH_SIZE * 4096;
 const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 64 * MB;
+const MAX_RESTARTS_OPTIMISTIC_READ: i32 = 100; // idk what to make this lol
 
 // TODO: use async i/o for disk reads and writes instead of pread/pwrite.
+// TODO: add error logging for unhandleable errors
+// TODO: use parking lot to park threads instead of spinning
 
 struct Mmap(*mut u8);
 
@@ -258,7 +261,7 @@ impl Default for PageEntry {
     }
 }
 
-// TODO: replace this with a ring.
+// TODO: replace this with a ring. replace remove with pop
 struct ResidentSet {
     hand: AtomicU64,
     entries: Box<[AtomicU64]>,
@@ -424,7 +427,6 @@ impl PageCache {
                                     data: slice,
                                 };
                                 return Ok(pg);
-                                // return Ok(unsafe { self.mem.to_ptr(page_id) })
                             }
                             Err(e) => {
                                 entry.rollback_evicted();
@@ -442,7 +444,6 @@ impl PageCache {
                             data: slice,
                         };
                         return Ok(pg);
-                        // return Ok(unsafe { self.mem.to_ptr(page_id) });
                     }
                 }
                 _ => (),
@@ -455,8 +456,6 @@ impl PageCache {
     fn unfix_read(&self, page_id: PageId) {
         self.get_page_entry(page_id).unlock_shared()
     }
-    // fn read(&self, page_id: PageId) -> &Page<'_> {
-    // }
     pub fn read_page(&self, page_id: PageId) -> Result<Page> {
         let entry = self.get_page_entry(page_id);
         loop {
@@ -466,8 +465,6 @@ impl PageCache {
                 PageState::EVICTED => {
                     if entry.lock(old) {
                         // handle fault
-                        // TODO: okay to short-circuit on failure to read? should probably reset to evicted.
-                        // that's safe to do because we have an exclusive lock here.
                         match unsafe { self.handle_fault(page_id) } {
                             Ok(_) => {
                                 entry.unlock();
@@ -478,7 +475,6 @@ impl PageCache {
                                     data: slice,
                                 };
                                 return Ok(pg);
-                                // return Ok(self.mem.to_ptr(page_id) as *const u8)
                             }
                             Err(e) => {
                                 entry.rollback_evicted();
@@ -496,36 +492,40 @@ impl PageCache {
                             data: slice,
                         };
                         return Ok(pg);
-                        // return Ok(self.mem.to_ptr(page_id) as *const u8);
                     }
                 }
             }
         }
     }
-    unsafe fn optimistic_read<F>(&self, page_id: PageId, f: F)
+    pub fn optimistic_read<F>(&self, page_id: PageId, f: F) -> Result<()>
     where
         F: Fn(&[u8]) -> (),
     {
+        let mut restart_counter = 0;
         let entry = self.get_page_entry(page_id);
         loop {
-            // TODO: consider falling back to exclusive locking to prevent repeated restarts.
+            // if we've restarted too many times, just fall back to grabbing a lock
+            if restart_counter == MAX_RESTARTS_OPTIMISTIC_READ {
+                let pg = self.read_page(page_id)?;
+                f(&pg);
+            }
             let old = entry.0.load(Ordering::SeqCst); // does this need to be seqcst?
             match PageState::get(old) {
                 PageState::UNLOCKED => {
                     // pass into function
-                    let slice = self.mem.to_slice(page_id);
+                    let slice = unsafe { self.mem.to_slice(page_id) };
                     f(slice);
                     if entry.0.load(Ordering::SeqCst) == old {
-                        return;
+                        return Ok(());
                     }
+                    restart_counter += 1;
                 }
                 PageState::MARKED => {
                     let new = PageState::set(old, PageState::UNLOCKED);
                     entry.cas_weak(old, new);
                 }
                 PageState::EVICTED => {
-                    self.write_page(page_id);
-                    self.unfix_write(page_id);
+                    self.write_page(page_id)?; // unpins in call to drop
                 }
                 _ => (),
             }
