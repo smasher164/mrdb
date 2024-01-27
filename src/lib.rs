@@ -13,6 +13,8 @@ use std::{
 
 use thiserror::Error;
 
+use tracing::{error};
+
 #[cfg_attr(target_family = "unix", path = "os_unix.rs")]
 #[cfg_attr(target_family = "windows", path = "os_windows.rs")]
 mod os;
@@ -42,6 +44,13 @@ pub enum Error {
     Utf16Error(#[from] widestring::error::Utf16Error),
 }
 
+// impl tracing::Value for Error {
+//     fn record(&self, key: &tracing::field::Field, visitor: &mut dyn tracing::field::Visit) {
+//         visitor.record_debug(key, &self)
+//     }
+// }
+// impl tracing::Sea
+
 type Result<T> = core::result::Result<T, Error>;
 
 const KB: u64 = 1024;
@@ -61,8 +70,8 @@ const DEFAULT_CACHE_CAPACITY_BYTES: u64 = 64 * MB;
 const MAX_RESTARTS_OPTIMISTIC_READ: i32 = 100; // idk what to make this lol
 
 // TODO: use async i/o for disk reads and writes instead of pread/pwrite.
-// TODO: add error logging for unhandleable errors
 // TODO: use parking lot to park threads instead of spinning
+// TODO: replace cache with a ring. replace remove with pop
 
 struct Mmap(*mut u8);
 
@@ -148,6 +157,12 @@ impl PageId {
     }
     pub fn unpack_offset(self) -> (u64, u64) {
         (self.size(), self.offset())
+    }
+}
+
+impl std::fmt::Display for PageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:x}_{:x}", self.pid(), self.page_count())
     }
 }
 
@@ -267,7 +282,6 @@ impl Default for PageEntry {
     }
 }
 
-// TODO: replace this with a ring. replace remove with pop
 struct ResidentSet {
     hand: AtomicU64,
     entries: Box<[AtomicU64]>,
@@ -579,14 +593,20 @@ impl PageCache {
             }
         }
         for page_id in &to_write {
-            unsafe { self.disk_write_page(*page_id) }; // TODO: make this async and handle write error. probably log?
+            unsafe {
+                if let Err(e) = self.disk_write_page(*page_id) {
+                    error!("failed to write page {}: {}", page_id, e);
+                }
+            };
             let entry = self.get_page_entry(*page_id);
             entry.mark_clean();
             to_evict.push(*page_id);
         }
         for page_id in &to_evict {
             unsafe {
-                self.mem.release(*page_id); // gotta handle the release error somehow. probably log?
+                if let Err(e) = self.mem.release(*page_id) {
+                    error!("failed to release page {}: {}", page_id, e);
+                }
             }
         }
         for page_id in &to_evict {

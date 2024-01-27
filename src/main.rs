@@ -1,17 +1,6 @@
-use std::{fs::File, mem::MaybeUninit, ffi::CStr, path::Path};
+use std::{path::Path};
 
 use mrdb;
-// use widestring::U16CStr;
-
-unsafe fn fill_half(p: *mut u16) {
-    *p = 'a' as _;
-    *p.add(1) = 0;
-}
-
-unsafe fn fill_half8(p: *mut i8) {
-    *p = 'a' as _;
-    *p.add(1) = 0;
-}
 
 fn main() {
     // let mut file = File::create("foo.txt").unwrap();

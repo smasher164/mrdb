@@ -1,4 +1,4 @@
-use crate::{Result, Mmap, Pread, Pwrite, FsInfo, max_file_size_from_fs_name};
+use crate::{Result, Mmap, Pread, Pwrite};
 use core::ffi::c_void;
 use std::{io, fs::File};
 
