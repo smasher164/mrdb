@@ -23,7 +23,7 @@ fn main() {
     // let fs_info = mrdb::get_fs_info(&f).unwrap();
     // println!("{:?}", fs_info);
     let db = mrdb::open_db(Path::new("hola")).unwrap();
-    let pid = mrdb::PageId::new_pid(1, 0);
-    let pg = db.write_page(pid).unwrap();
+    // let pid = mrdb::PageId::new_pid(1, 0);
+    // let pg = db.write_page(pid).unwrap();
     
 }

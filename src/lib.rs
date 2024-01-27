@@ -8,12 +8,12 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
     str::Utf8Error,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering}, thread::sleep, time::Duration,
 };
 
 use thiserror::Error;
 
-use tracing::{error};
+use tracing::{info, error};
 
 #[cfg_attr(target_family = "unix", path = "os_unix.rs")]
 #[cfg_attr(target_family = "windows", path = "os_windows.rs")]
@@ -385,6 +385,8 @@ impl PageCache {
         ))]
         os::advise_random_read(&f)?;
 
+        println!("vm_size_bytes={vm_size_bytes}");
+
         let mem = Mmap::create_virt_mem(vm_size_bytes)?;
         let ahasher = ahash::RandomState::new();
         let page_state = DashMap::with_hasher(ahasher);
@@ -639,7 +641,7 @@ pub fn open_db(path: &Path) -> Result<PageCache> {
     let inf = fsinfo::get_fs_info(&f)?;
 
     // the limit of our virtual memory mapping
-    let vm_size_bytes = MAX_PAGES_LARGE * PAGE_SIZE.min(inf.disk_size).min(inf.max_file_size);
+    let vm_size_bytes = (50 * TB).min(inf.disk_size).min(inf.max_file_size);
     PageCache::new(f, vm_size_bytes, DEFAULT_CACHE_CAPACITY_BYTES)
 }
 
