@@ -21,6 +21,7 @@ init_array = "0.3.0"
 dashmap = "5.5.3"
 ahash = "0.8.7"
 tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.151"
