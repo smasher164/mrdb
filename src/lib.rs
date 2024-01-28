@@ -72,6 +72,8 @@ const MAX_RESTARTS_OPTIMISTIC_READ: i32 = 100; // idk what to make this lol
 // TODO: use async i/o for disk reads and writes instead of pread/pwrite.
 // TODO: use parking lot to park threads instead of spinning
 // TODO: replace cache with a ring. replace remove with pop
+// TODO: Some way to auto-flush before program termination. we could do it on Drop of the PageCache.
+//       However, we might prefer handling this at a higher-level via the logging/crash-recovery process.
 
 struct Mmap(*mut u8);
 
